@@ -126,6 +126,11 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
+      # 这个 workflow 原本没有 checkout：GITHUB_WORKSPACE 是空的，所以引用仓库内文件
+      # （patches/onep_6.12_susfs_fixup.patch）会报 No such file or directory。
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Configure Git
         run: |
           git config --global user.name "Numbersf"
@@ -198,8 +203,15 @@ jobs:
           if [ -f common/scripts/setlocalversion ]; then
             sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' common/scripts/setlocalversion
           fi
-          git add -A || true
-          git commit -m "Force remove -dirty suffix from kernel version" || true
+          # 只有在 kernel_platform 自己就是 git 根时才提交。纯 GKI 树里它只是外层仓库的子目录，
+          # 直接 git add -A 会把整棵内核树加进外层仓库（既慢又无意义）。
+          TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null || true)
+          if [ "$TOPLEVEL" = "$PWD" ]; then
+            git add -A || true
+            git commit -m "Force remove -dirty suffix from kernel version" || true
+          else
+            echo "skip git commit: kernel_platform is not a git root (toplevel=${TOPLEVEL:-none})"
+          fi
 
       # 添加 SukiSU Ultra
       - name: Add KernelSU-SukiSU Ultra

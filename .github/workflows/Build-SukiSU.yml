@@ -167,7 +167,12 @@ jobs:
             echo "::error::kernel source missing after repo sync"
             exit 1
           fi
-          echo "kernel source dirs:"; ls -d kernel_platform/common kernel_platform/msm-kernel 2>&1
+          # 注意：oneplus_15 等纯 GKI manifest 只有 kernel_platform/common，没有 msm-kernel。
+          # 把两个目录一起喂给 ls 会因其中一个缺失而返回非 0，在 bash -e 下会中断整步。
+          echo "kernel source dirs:"
+          for d in kernel_platform/common kernel_platform/msm-kernel; do
+            if [ -d "$d" ]; then echo "  present: $d"; else echo "  absent : $d"; fi
+          done
           if [  -e kernel_platform/common/BUILD.bazel ]; then
           sed -i '/^[[:space:]]*"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64",$/d' kernel_platform/common/BUILD.bazel
           fi
@@ -181,12 +186,20 @@ jobs:
       - name: Force remove -dirty suffix
         run: |
           cd kernel_workspace/kernel_platform
-          sed -i 's/ -dirty//g' common/scripts/setlocalversion
-          sed -i 's/ -dirty//g' msm-kernel/scripts/setlocalversion
-          sed -i 's/ -dirty//g' external/dtc/scripts/setlocalversion
-          sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' common/scripts/setlocalversion
-          git add -A
-          git commit -m "Force remove -dirty suffix from kernel version"
+          # msm-kernel 在纯 GKI manifest 中不存在，逐个判断，避免某一项缺失导致整步中断
+          for f in common/scripts/setlocalversion msm-kernel/scripts/setlocalversion external/dtc/scripts/setlocalversion; do
+            if [ -f "$f" ]; then
+              sed -i 's/ -dirty//g' "$f"
+              echo "patched: $f"
+            else
+              echo "skip (absent): $f"
+            fi
+          done
+          if [ -f common/scripts/setlocalversion ]; then
+            sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' common/scripts/setlocalversion
+          fi
+          git add -A || true
+          git commit -m "Force remove -dirty suffix from kernel version" || true
 
       # 添加 SukiSU Ultra
       - name: Add KernelSU-SukiSU Ultra

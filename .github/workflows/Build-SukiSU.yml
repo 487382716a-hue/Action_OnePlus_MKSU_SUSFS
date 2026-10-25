@@ -309,6 +309,21 @@ jobs:
           assert '&ksu_lsmid' in read('kernel/hook/lsm_hook.c')
           print('[ok] SukiSU 6.12 compat applied')
           PY
+          cd ..
+          # ---- 把 kernelsu 从相对软链接换成实体目录 ----
+          # setup.sh 建的是相对软链接：common/drivers/kernelsu -> ../../../KernelSU/kernel。
+          # oplus_build_kernel.sh 在模块阶段会把 common 整棵树拷到
+          #   out/target/product/<chip>/obj/DLKM_OBJ/kernel_platform/super_kernel/
+          # 再在里面跑 `make O=... dtbs olddefconfig`。软链接换了目录深度就悬空，于是：
+          #   drivers/Kconfig:248: can't open file "drivers/kernelsu/Kconfig"
+          # 内核镜像本身已编成功，是这一步把整轮拉挂的。实体目录在两种拷贝（跟链/不跟链）下都成立。
+          rm -f common/drivers/kernelsu
+          cp -a KernelSU/kernel common/drivers/kernelsu
+          [ -f common/drivers/kernelsu/hook/lsm_hook.c ] || {
+            echo "::error::failed to materialize common/drivers/kernelsu"; exit 1; }
+          grep -q 'ksu_lsmid' common/drivers/kernelsu/hook/lsm_hook.c || {
+            echo "::error::patched lsm_hook.c not carried into common/drivers/kernelsu"; exit 1; }
+          echo "[ok] common/drivers/kernelsu is a real directory now"
 
       - name: Apply Patches SukiSU Ultra
         run: |
@@ -488,10 +503,16 @@ jobs:
          # 更麻烦的是 oplus_build_kernel.sh 吞掉了这个错误、仍然返回 0（步骤显示成功但 out/ 是空的），
          # 所以这里必须自己断言产物存在。
          SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ github.event.inputs.CPUD }} ${{ github.event.inputs.BUILD_METHOD }}
-         if ! find kernel_workspace/kernel_platform/out -type f -name Image 2>/dev/null | grep -q .; then
+         # 已经 cd kernel_workspace，所以这里是 kernel_platform/out（原来写成
+         # kernel_workspace/kernel_platform/out，路径多一层，find 永远空 → 必然报假错）
+         # oplus 流程除了 dist 之外还可能把 Image 拷进 device/qcom/<chip>-kernel，一并找。
+         IMG=$(find kernel_platform/out kernel_platform/bazel-out device/qcom \
+                     -type f -name Image 2>/dev/null | head -n 1)
+         if [ -z "$IMG" ]; then
            echo "::error::kernel build finished but produced no Image, see the log above"
            exit 1
          fi
+         echo "IMAGE_PATH=$IMG" >> "$GITHUB_ENV"
 
       - name: Make AnyKernel3
         run: |
@@ -501,12 +522,18 @@ jobs:
           # 不同 SoC / 构建方式的产物目录名不一样（-gki / -perf / bazel-out / gki_kernel…），
           # 原来硬编码 5 条路径，sm8850 的 oplus 构建实际落在 -perf 上，全部落空。
           # 这里直接定位 Image，再反推 dist 目录，后续步骤统一用 DIST_DIR。
-          IMAGE_PATH=$(find kernel_workspace/kernel_platform/out \
-                            kernel_workspace/kernel_platform/bazel-out \
-                            -type f -name Image 2>/dev/null | head -n 1)
+          # 上一步已经找到了 Image 并写进 IMAGE_PATH；优先用它，避免这里再猜一遍目录。
+          if [ -n "${IMAGE_PATH:-}" ] && [ -f "${IMAGE_PATH:-}" ]; then
+            echo "Image 复用上一步定位结果: $IMAGE_PATH"
+          else
+            IMAGE_PATH=$(find kernel_workspace/kernel_platform/out \
+                              kernel_workspace/kernel_platform/bazel-out \
+                              kernel_workspace/device/qcom \
+                              -type f -name Image 2>/dev/null | head -n 1)
+          fi
 
           if [ -z "$IMAGE_PATH" ]; then
-            echo "::error::no Image found under kernel_platform/{out,bazel-out}"
+            echo "::error::no Image found under kernel_platform/{out,bazel-out} or device/qcom"
             ls -d kernel_workspace/kernel_platform/out/* 2>/dev/null || echo "(out 目录不存在)"
             exit 1
           fi
@@ -540,10 +567,15 @@ jobs:
 
           curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/refs/heads/main/kpm/patch_linux" -o patch_linux
           chmod +x patch_linux
-          ./patch_linux
-          rm -f Image
-          mv oImage Image
-          cp Image $GITHUB_WORKSPACE/AnyKernel3/Image
+          ./patch_linux || echo "::warning::patch_linux 返回非 0，继续检查是否产出了 oImage"
+          if [ -f oImage ]; then
+            rm -f Image
+            mv oImage Image
+            cp Image "$GITHUB_WORKSPACE"/AnyKernel3/Image
+            echo "Image 已打 KPM 补丁"
+          else
+            echo "::warning::没有 oImage，Image 保持未打补丁 —— KPM 不可用，其它功能不受影响"
+          fi
 
       # 下载 SUSFS 模块（CI）
       - name: Download Latest SUSFS Module from CI
@@ -553,23 +585,32 @@ jobs:
             "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs?status=success" | \
             jq -r '.workflow_runs[] | select(.head_branch == "v1.5.2+") | .id' | head -n 1)
 
-          if [ -z "$LATEST_RUN_ID" ]; then
-            echo "No successful run found for branch v1.5.2+"
-            exit 1
+          if [ -z "$LATEST_RUN_ID" ] || [ "$LATEST_RUN_ID" = "null" ]; then
+            echo "::warning::上游 v1.5.2+ 分支没有成功的 CI 运行，跳过该附属模块"
+            exit 0
           fi
 
           ARTIFACT_URL=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs/$LATEST_RUN_ID/artifacts" | jq -r '.artifacts[0].archive_download_url')
 
-          curl -L -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -o ksu_module_susfs.zip "$ARTIFACT_URL"
-          cp ksu_module_susfs.zip ./AnyKernel3/
+          # 这个 zip 只是塞进卡刷包的可选附属模块；编内核已经花了大半小时，
+          # 不该因为它下不来而丢掉整轮产物。失败就明确告警并继续。
+          if curl -fL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -o ksu_module_susfs.zip "$ARTIFACT_URL"; then
+            cp ksu_module_susfs.zip ./AnyKernel3/ && echo "SUSFS 模块已放入卡刷包"
+          else
+            echo "::warning::SUSFS 模块下载失败（上游 CI 产物权限/分支名变动），本轮不带该附属模块"
+            rm -f ksu_module_susfs.zip
+          fi
 
       # 下载 SUSFS 模块（Release）
       - name: Download Latest SUSFS Module from Release
         if: ${{ github.event.inputs.SUSFS_CI == 'false' }}
         run: |
-          wget https://github.com/sidex15/ksu_module_susfs/releases/latest/download/ksu_module_susfs_1.5.2+.zip
-          cp ksu_module_susfs_1.5.2+.zip ./AnyKernel3/
+          if wget https://github.com/sidex15/ksu_module_susfs/releases/latest/download/ksu_module_susfs_1.5.2+.zip; then
+            cp ksu_module_susfs_1.5.2+.zip ./AnyKernel3/
+          else
+            echo "::warning::SUSFS 模块（Release）下载失败，本轮不带该附属模块"
+          fi
 
       - name: Set suffix
         id: suffix

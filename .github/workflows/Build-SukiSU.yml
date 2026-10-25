@@ -243,6 +243,73 @@ jobs:
           export KSU_VERSION=$KSU_VERSION
           sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
 
+      # setup.sh 的 `builtin` 参数其实是 git 分支名，检出的是老一代 KernelSU 驱动，
+      # 只适配到 6.1 左右。在一加 6.12 树上有两处源码级不兼容（编译器实测）：
+      #   1) security_add_hooks() 自 6.12 起第三个参数由 const char * 改为 const struct lsm_id *
+      #      error: incompatible pointer types passing 'char[4]' to parameter of type 'const struct lsm_id *'
+      #   2) netlink_kernel_cfg 自 6.12 起删掉了 cb_mutex 字段（KPM 的字段偏移表还在引用它）
+      #      error: no member named 'cb_mutex' in 'struct netlink_kernel_cfg'
+      #      连带 invalid application of 'sizeof' to an incomplete type 'struct DynamicStructMember[]'
+      # 这里按 6.12 真实头文件做最小适配（只加版本分支，不动原有逻辑，不影响其它内核版本）。
+      - name: Patch SukiSU driver for 6.12
+        run: |
+          cd kernel_workspace/kernel_platform/KernelSU
+          python3 - <<'PY'
+          import io, sys
+
+          def read(p):
+              with io.open(p, encoding='utf-8') as f:
+                  return f.read()
+
+          def write(p, s):
+              with io.open(p, 'w', encoding='utf-8', newline='\n') as f:
+                  f.write(s)
+
+          # ---- 1) lsm_hook.c：security_add_hooks() 的 lsm_id ----
+          p = 'kernel/hook/lsm_hook.c'
+          s = read(p)
+          if 'ksu_lsmid' in s:
+              print('[patch] lsm_hook.c already patched')
+          else:
+              anchor = 'void __init ksu_lsm_hook_init(void)\n{\n'
+              if anchor not in s:
+                  sys.exit('FATAL: ksu_lsm_hook_init anchor not found in %s' % p)
+              decl = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)\n'
+                      'static struct lsm_id ksu_lsmid = {\n'
+                      '    .name = "ksu",\n'
+                      '    .id = 1000,\n'
+                      '};\n'
+                      '#endif\n\n')
+              old = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)\n'
+                     '    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu");')
+              new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)\n'
+                     '    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), &ksu_lsmid);\n'
+                     '#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)\n'
+                     '    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu");')
+              if old not in s:
+                  sys.exit('FATAL: security_add_hooks call site not found in %s' % p)
+              s = s.replace(anchor, decl + anchor, 1).replace(old, new, 1)
+              write(p, s)
+              print('[patch] lsm_hook.c: security_add_hooks(..., &ksu_lsmid) for 6.12+')
+
+          # ---- 2) KPM super_access.c：netlink_kernel_cfg.cb_mutex 在 6.12 已删除 ----
+          p = 'kernel/extension/kpm/super_access.c'
+          s = read(p)
+          old = 'DEFINE_MEMBER(netlink_kernel_cfg, cb_mutex)\n'
+          if old not in s:
+              print('[patch] super_access.c: cb_mutex already guarded/absent, skip')
+          else:
+              new = ('#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)\n'
+                     'DEFINE_MEMBER(netlink_kernel_cfg, cb_mutex)\n'
+                     '#endif\n')
+              write(p, s.replace(old, new, 1))
+              print('[patch] super_access.c: cb_mutex guarded out for 6.12+')
+
+          # ---- 校验，避免"打了但没生效" ----
+          assert '&ksu_lsmid' in read('kernel/hook/lsm_hook.c')
+          print('[ok] SukiSU 6.12 compat applied')
+          PY
+
       - name: Apply Patches SukiSU Ultra
         run: |
           cd kernel_workspace

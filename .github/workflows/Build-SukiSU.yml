@@ -233,6 +233,16 @@ jobs:
 
           cd ./common
           patch -p1 < 50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch || true
+
+          # 上面这步带了 `|| true`：补丁是按 Google GKI 6.12 生成的，OnePlus 的 6.12 在
+          # fs/exec.c（include 区）和 fs/proc/task_mmu.c（show_smap / show_smaps_rollup）上有差异，
+          # 会有 4 个 hunk 打不上而被静默跳过。下面用按本树真实源码重生成的补丁补齐这 4 处，
+          # 并且严格校验（不打 `|| true`）——exec.c 少一个 include、task_mmu 少两个隐藏钩子，
+          # 都会让编译失败或让 SUSFS 的 maps 隐藏失效。
+          echo "补齐 SUSFS 补丁在 OnePlus 6.12 树上未应用的 4 个 hunk"
+          patch -p1 -F 3 < "$GITHUB_WORKSPACE/patches/onep_6.12_susfs_fixup.patch"
+          grep -q 'linux/susfs_def.h' fs/exec.c
+          grep -q 'SUSFS_IS_INODE_SUS_MAP' fs/proc/task_mmu.c
           echo "完成"
 
       - name: Apply Hide Stuff Patches
@@ -240,7 +250,21 @@ jobs:
           cd kernel_workspace/kernel_platform/common
           cp ../../SukiSU_patch/69_hide_stuff.patch ./
           echo "正在打隐藏应用补丁"
-          patch -p1 -F 3 < 69_hide_stuff.patch
+          # 该补丁含两个文件：
+          #   fs/proc/task_mmu.c —— 伪造 jit-zygote-cache / lineage 的 maps 行（有用，必须打）
+          #   fs/proc/base.c     —— 只对 map_files 里名为 lineage 的条目做伪装（面向 lineage ROM），
+          #                         上下文与本树不匹配会导致整步失败，且对 stock ColorOS 无实际作用
+          # 所以只取 task_mmu.c 那一段来打。
+          python3 - <<'PY'
+          import re
+          txt = open('69_hide_stuff.patch').read()
+          blocks = re.split(r'(?m)^(?=--- a/)', txt)
+          keep = [b for b in blocks if b.startswith('--- a/fs/proc/task_mmu.c')]
+          assert keep, 'task_mmu.c hunk not found in 69_hide_stuff.patch'
+          open('69_hide_task_mmu.patch', 'w').write(''.join(keep))
+          print('filtered bytes:', len(''.join(keep)))
+          PY
+          patch -p1 -F 3 < 69_hide_task_mmu.patch
 
       - name: Apply LZ4KD
         run: |

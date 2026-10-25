@@ -277,6 +277,12 @@ jobs:
           echo "完成"
 
       - name: Apply Hide Stuff Patches
+        # 6.12 起 show_map_vma() 被重写过（改用 get_vma_name()，没有局部变量 file，
+        # 也没有 done / bypass 标签）。69_hide_stuff.patch 的 task_mmu 段仍能"打上"，
+        # 但插入的代码引用了不存在的 file / done / bypass，编译必定报错：
+        #   error: use of undeclared identifier 'file'
+        # 所以只对 6.12 以前的内核应用；6.12 上跳过（若需要 6.12 版本要单独重写这几处）。
+        if: ${{ github.event.inputs.KERNEL_VERSION != '6.12' }}
         run: |
           cd kernel_workspace/kernel_platform/common
           cp ../../SukiSU_patch/69_hide_stuff.patch ./

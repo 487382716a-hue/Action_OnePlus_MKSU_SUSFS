@@ -561,21 +561,11 @@ jobs:
           echo "Image: $IMAGE_PATH"
           cp "$IMAGE_PATH" ./AnyKernel3/Image
 
-          # 可选复制其它新文件（如果存在）
-          if [ "${{ github.event.inputs.CPU }}" = "sm8750" ] || [ "${{ github.event.inputs.CPU }}" = "sm8850" ]; then
-          for file in dtbo.img system_dlkm.erofs.img vendor_dlkm.img vendor_boot.img; do
-            if [ -f "$DIST_DIR/$file" ]; then
-              target_name="$file"
-              # 特殊处理 system_dlkm.erofs.img 的目标名
-              if [ "$file" = "system_dlkm.erofs.img" ]; then
-                target_name="system_dlkm.img"
-              fi
-              cp "$DIST_DIR/$file" "./AnyKernel3/$target_name"
-            else
-              echo "$file 不存在，跳过复制"
-            fi
-          done
-          fi
+          # 不要再把 dtbo.img / vendor_boot.img / vendor_dlkm.img / system_dlkm.img 塞进包里。
+          # 依据：Numbersf/AnyKernel3 的 anykernel.sh 全文只有 split_boot / unpack_ramdisk /
+          # write_boot / flash_boot，BLOCK=boot，**一处都没有引用这四个文件**——它们占 ~104 MB
+          # 却永远不会被刷入；真要刷也只会把厂商 vendor 分区整块覆盖成 CI 产物，风险更高。
+          # 上一版 142 MB 里有 4/5 是这类死重量，只保留 Image 后 ≈20 MB（cctv18 那条流水线同理）。
 
       - name: Apply patch_linux and replace Image
         if: ${{ github.event.inputs.KPM == 'true' }}
@@ -613,11 +603,14 @@ jobs:
 
           # 这个 zip 只是塞进卡刷包的可选附属模块；编内核已经花了大半小时，
           # 不该因为它下不来而丢掉整轮产物。失败就明确告警并继续。
-          if curl -fL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -o ksu_module_susfs.zip "$ARTIFACT_URL"; then
-            cp ksu_module_susfs.zip ./AnyKernel3/ && echo "SUSFS 模块已放入卡刷包"
+          # anykernel.sh 按固定文件名找模块：
+          #   ksu_module_susfs_1.5.2+_Release.zip / ksu_module_susfs_1.5.2+_CI.zip
+          # 之前存成 ksu_module_susfs.zip，名字对不上 → 刷机时永远走 "No SUSFS Module found"
+          if curl -fL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -o ksu_module_susfs_1.5.2+_CI.zip "$ARTIFACT_URL"; then
+            cp ksu_module_susfs_1.5.2+_CI.zip ./AnyKernel3/ && echo "SUSFS 模块（CI）已放入卡刷包"
           else
             echo "::warning::SUSFS 模块下载失败（上游 CI 产物权限/分支名变动），本轮不带该附属模块"
-            rm -f ksu_module_susfs.zip
+            rm -f ksu_module_susfs_1.5.2+_CI.zip
           fi
 
       # 下载 SUSFS 模块（Release）
@@ -625,10 +618,31 @@ jobs:
         if: ${{ github.event.inputs.SUSFS_CI == 'false' }}
         run: |
           if wget https://github.com/sidex15/ksu_module_susfs/releases/latest/download/ksu_module_susfs_1.5.2+.zip; then
-            cp ksu_module_susfs_1.5.2+.zip ./AnyKernel3/
+            # 同 CI 分支：必须用 anykernel.sh 认识的文件名，否则模块装不上
+            mv ksu_module_susfs_1.5.2+.zip ksu_module_susfs_1.5.2+_Release.zip
+            cp ksu_module_susfs_1.5.2+_Release.zip ./AnyKernel3/
           else
             echo "::warning::SUSFS 模块（Release）下载失败，本轮不带该附属模块"
           fi
+
+      # 打包后的守门检查：内核在、废重不在。之前靠人肉发现"142 MB 里有 4/5 是死文件"，
+      # 加断言以后回归会当场报错，不会再悄悄产出一个臃肿包。
+      - name: Verify AnyKernel3 contents
+        run: |
+          if [ ! -f AnyKernel3/Image ]; then
+            echo "::error::AnyKernel3/Image 缺失"
+            exit 1
+          fi
+          for f in dtbo.img vendor_boot.img vendor_dlkm.img system_dlkm.img; do
+            if [ -f "AnyKernel3/$f" ]; then
+              echo "::error::$f 又被塞进包里了（anykernel.sh 根本不引用它）"
+              exit 1
+            fi
+          done
+          echo "--- 包内文件 ---"
+          ls -l AnyKernel3
+          echo "--- 总体积 ---"
+          du -sh AnyKernel3
 
       - name: Set suffix
         id: suffix

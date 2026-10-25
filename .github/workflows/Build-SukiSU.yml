@@ -187,6 +187,25 @@ jobs:
           rm kernel_platform/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
           rm kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
 
+          # kleaf 的 check_defconfig 会把 gki_defconfig 和 savedefconfig 的结果逐行比对。
+          # 本树原版 gki_defconfig 里的 CONFIG_KALLSYMS_ALL 就已经不是 savedefconfig 形态，
+          # 再叠加我们追加的 CONFIG_KSU*，这个断言必然失败（同一文件里 kernel_aarch64_tv 也是 disabled）。
+          # 只关掉这个断言，实际生效的 config 完全不变。
+          if [ -f kernel_platform/common/BUILD.bazel ]; then
+          python3 - <<'PY'
+          p = 'kernel_platform/common/BUILD.bazel'
+          s = open(p).read()
+          needle = '    name = "kernel_aarch64",\n'
+          patched = needle + '    check_defconfig = "disabled",\n'
+          if patched in s:
+              print('check_defconfig already disabled for kernel_aarch64')
+          else:
+              assert needle in s, 'kernel_aarch64 rule not found in BUILD.bazel'
+              open(p, 'w').write(s.replace(needle, patched, 1))
+              print('check_defconfig disabled for kernel_aarch64')
+          PY
+          fi
+
       # 删除 -dirty 后缀
       - name: Force remove -dirty suffix
         run: |
@@ -294,6 +313,16 @@ jobs:
           cd kernel_workspace/kernel_platform
           CONFIG_FILE=./common/arch/arm64/configs/gki_defconfig
           KERNEL_VERSION="${{ github.event.inputs.KERNEL_VERSION }}"
+
+          # 下面追加的 CONFIG_KSU* 只有在 Kconfig 接线存在时才会生效，否则会被 kconfig 静默忽略，
+          # 编出一个"看起来成功、其实没有 KSU/SUSFS"的内核。先断言接线。
+          grep -q 'drivers/kernelsu/Kconfig' ./common/drivers/Kconfig || {
+            echo "::error::KernelSU Kconfig is not sourced from common/drivers/Kconfig"; exit 1; }
+          [ -d ./common/drivers/kernelsu ] || {
+            echo "::error::common/drivers/kernelsu symlink missing"; exit 1; }
+          grep -q 'KSU_SUSFS' ./common/drivers/kernelsu/Kconfig || {
+            echo "::error::KSU_SUSFS options not found in kernelsu Kconfig"; exit 1; }
+          echo "KernelSU/SUSFS Kconfig wiring OK"
 
           # SukiSU Ultra config
           echo "CONFIG_KSU=y" >> "$CONFIG_FILE"
